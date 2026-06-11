@@ -59,7 +59,10 @@ function parseCSV(text) {
   const ti=headers.findIndex(h=>h==="ticker"||h==="symbol"||h.includes("ticker dell"));
   const si=headers.findIndex(h=>h.includes("settore")||h.includes("sector"));
   const ai=headers.findIndex(h=>h.includes("asset class")||h==="asset class");
-  const gi=headers.findIndex(h=>h.includes("area geografica")||h.includes("geography")||h.includes("country")||h.includes("paese")||h.includes("area geo"));
+  const gi=headers.findIndex(h=>h.includes("area geografica")||h.includes("geography")||h.includes("country")||h.includes("paese")||h.includes("area geo")||h==="location"||h.includes("location"));
+  console.log('DEBUG headers:', headers);
+  console.log('DEBUG gi:', gi, '-> ', headers[gi]);
+  console.log('DEBUG ni:', ni, '-> ', headers[ni]);
   if(ni===-1) return {holdings:[],skipped:0};
   const holdings=[]; let skipped=0;
   for(let i=hi+1;i<lines.length;i++){
