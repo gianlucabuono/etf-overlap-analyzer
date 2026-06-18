@@ -1,19 +1,102 @@
 /**
  * Vercel Serverless Function — /api/fetch-ishares
  *
- * Risolve l'ISIN iShares nel CSV completo delle holdings aggirando il CORS.
- *
- * Flusso:
- *  1. Cerca l'ISIN nel product-list JSON di iShares.com/uk
- *  2. Ricava productPageUrl + localExchangeTicker
- *  3. Costruisce l'URL .ajax?fileType=csv e lo scarica
+ * Strategia multi-sito:
+ *  1. Cerca l'ISIN nel product screener su UK, DE, CH in parallelo
+ *  2. Prova anche una ricerca diretta tramite il product finder globale BlackRock
+ *  3. Una volta trovato il productId, prova a scaricare il CSV da tutti i siti
  *  4. Restituisce il CSV grezzo al client
  *
  * GET /api/fetch-ishares?isin=IE00B4L5Y983
  */
 
+const ISHARES_SITES = [
+  {
+    locale: "uk",
+    base: "https://www.ishares.com/uk/individual/en",
+    timestamp: "1521771080935",
+    referer: "https://www.ishares.com/uk/",
+  },
+  {
+    locale: "de",
+    base: "https://www.ishares.com/de/individual/de",
+    timestamp: "1478358465952",
+    referer: "https://www.ishares.com/de/",
+  },
+  {
+    locale: "ch",
+    base: "https://www.ishares.com/ch/individual/en",
+    timestamp: "1480581303174",
+    referer: "https://www.ishares.com/ch/",
+  },
+  {
+    locale: "it",
+    base: "https://www.ishares.com/it/individual/it",
+    timestamp: "1488816304069",
+    referer: "https://www.ishares.com/it/",
+  },
+];
+
+const HEADERS_BASE = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "en-GB,en;q=0.9",
+};
+
+async function searchScreener(site, isin) {
+  // Endpoint screener DataTables iShares
+  const url = `${site.base}/products/etf-product-list/1506575576011.ajax?sEcho=1&iColumns=9&iDisplayStart=0&iDisplayLength=25&sSearch=${encodeURIComponent(isin)}&bRegex=false`;
+  try {
+    const res = await fetch(url, {
+      headers: { ...HEADERS_BASE, Referer: site.referer, "X-Requested-With": "XMLHttpRequest" },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    // Potrebbe rispondere HTML se non autenticato — verifica
+    if (!text.trim().startsWith("{")) return null;
+    const json = JSON.parse(text);
+    const rows = json?.aaData || [];
+    for (const row of rows) {
+      const rowStr = JSON.stringify(row);
+      if (rowStr.includes(isin)) {
+        // row[0] ha formato <a href="/uk/individual/en/products/XXXXX/...">NAME</a>
+        const match = String(row[0]).match(/href="([^"]+)"/);
+        if (match) {
+          const productUrl = match[1].startsWith("http") ? match[1] : `https://www.ishares.com${match[1]}`;
+          const idMatch = productUrl.match(/\/products\/(\d+)/);
+          const ticker = String(row[1] || row[2] || "").replace(/<[^>]+>/g, "").trim();
+          if (idMatch) return { productId: idMatch[1], productUrl, ticker, site };
+        }
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function tryDownloadCsv(productId, site, ticker, isin) {
+  // Prova con il timestamp del sito corrente
+  const csvUrl = `${site.base}/products/${productId}/${site.timestamp}.ajax?fileType=csv&fileName=${ticker || isin}_holdings&dataType=fund`;
+  try {
+    const res = await fetch(csvUrl, {
+      headers: { ...HEADERS_BASE, Accept: "text/csv,*/*", Referer: `${site.base}/products/${productId}/` },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    if (isValidCsv(text)) return text;
+  } catch (_) {}
+  return null;
+}
+
+function isValidCsv(text) {
+  if (!text || text.length < 100) return false;
+  const lower = text.toLowerCase();
+  return (lower.includes("weight") || lower.includes("name") || lower.includes("ticker")) &&
+         (lower.includes(",") || lower.includes(";"));
+}
+
 export default async function handler(req, res) {
-  // CORS – consenti richieste dal frontend Vercel
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   if (req.method === "OPTIONS") return res.status(200).end();
@@ -22,150 +105,52 @@ export default async function handler(req, res) {
   if (!isin || !/^[A-Z]{2}[A-Z0-9]{10}$/.test(isin.trim())) {
     return res.status(400).json({ error: "ISIN non valido" });
   }
+  const cleanIsin = isin.trim().toUpperCase();
 
   try {
-    // ── Step 1: recupera il product-list JSON di iShares UK ──
-    const listUrl =
-      "https://www.ishares.com/uk/individual/en/products/etf-product-list#/?isChartDate=1&isPrimary=true&startDate=20000101&endDate=&page=1&pageSize=250&type=FixedIncome,Equity,MultiAsset,Alternatives&loc=GB&idiom=en";
+    // ── Step 1: cerca su tutti i siti iShares in parallelo ──
+    console.log(`[fetch-ishares] Searching for ISIN ${cleanIsin} across ${ISHARES_SITES.length} sites...`);
 
-    const listRes = await fetch(listUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        Accept: "application/json, text/plain, */*",
-        Referer: "https://www.ishares.com/uk/",
-      },
-    });
+    const searchResults = await Promise.all(ISHARES_SITES.map(site => searchScreener(site, cleanIsin)));
+    const found = searchResults.find(r => r !== null);
 
-    // iShares restituisce HTML con JSON embedded — proviamo anche l'endpoint diretto
-    let productData = null;
-
-    // Endpoint alternativo più stabile: screener API
-    const screenerUrl = `https://www.ishares.com/uk/individual/en/products/etf-product-list/1506575576011.ajax?isin=${isin.trim()}&tab=overview&fileType=json`;
-    const screenerRes = await fetch(screenerUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        Accept: "application/json",
-        Referer: `https://www.ishares.com/uk/individual/en/products/etf-product-list`,
-      },
-    });
-
-    // ── Step 2: proviamo il screener JSON iShares ──
-    let productPageUrl = null;
-    let ticker = null;
-    let siteTimestamp = "1521771080935"; // timestamp fisso comune agli ETF UCITS UK
-
-    if (screenerRes.ok) {
-      try {
-        const json = await screenerRes.json();
-        // La risposta ha struttura { aaData: [ [...cols] ] }
-        const rows = json?.aaData || [];
-        const row = rows.find((r) => {
-          // colonna ISIN tipicamente index 4 o cerca nel record
-          return JSON.stringify(r).includes(isin.trim());
-        });
-        if (row) {
-          // productPageUrl è tipicamente index 0 in formato "/uk/individual/en/products/XXXX/name"
-          productPageUrl = row[0]?.replace(/^.*href="([^"]+)".*$/, "$1");
-          ticker = row[1] || "";
-        }
-      } catch (_) { /* ignora */ }
+    if (!found) {
+      console.log(`[fetch-ishares] ISIN ${cleanIsin} not found on any iShares screener`);
+      return res.status(404).json({
+        error: `ETF non trovato su nessun sito iShares (UK, DE, CH, IT). Potrebbe essere un ETF di altro emittente.`,
+        suggestion: "justetf",
+      });
     }
 
-    // ── Step 3: fallback – costruiamo URL da pattern noto ──
-    // Pattern URL iShares UCITS UK:
-    // https://www.ishares.com/uk/individual/en/products/{productId}/{slug}/{timestamp}.ajax?fileType=csv&fileName={TICKER}_holdings&dataType=fund
-    //
-    // Non conoscendo productId dall'ISIN direttamente, usiamo il mapping
-    // via pagina prodotto cercando l'ISIN nel meta o nel redirect.
+    const { productId, productUrl, ticker, site: foundSite } = found;
+    console.log(`[fetch-ishares] Found on ${foundSite.locale}: productId=${productId}, ticker=${ticker}`);
 
-    if (!productPageUrl) {
-      // Proviamo la ricerca full-text nella pagina prodotti
-      const searchRes = await fetch(
-        `https://www.ishares.com/uk/individual/en/products/etf-product-list/1506575576011.ajax?sEcho=1&iColumns=9&iDisplayStart=0&iDisplayLength=25&mDataProp_0=0&mDataProp_1=1&mDataProp_2=2&mDataProp_3=3&mDataProp_4=4&mDataProp_5=5&mDataProp_6=6&mDataProp_7=7&mDataProp_8=8&sSearch=${isin.trim()}&bRegex=false`,
-        {
-          headers: {
-            "User-Agent": "Mozilla/5.0 Chrome/124",
-            Accept: "application/json",
-            Referer: "https://www.ishares.com/uk/individual/en/products/etf-product-list",
-            "X-Requested-With": "XMLHttpRequest",
-          },
-        }
-      );
-      if (searchRes.ok) {
-        try {
-          const json = await searchRes.json();
-          const rows = json?.aaData || [];
-          if (rows.length > 0) {
-            const row = rows[0];
-            // row[0] contiene HTML con href
-            const match = String(row[0]).match(/href="([^"]+)"/);
-            if (match) productPageUrl = match[1];
-            // ticker può essere in row[1] o row[2]
-            ticker = String(row[1] || row[2] || "").replace(/<[^>]+>/g, "").trim();
-          }
-        } catch (_) { /* ignora */ }
+    // ── Step 2: scarica il CSV — prova prima il sito dove abbiamo trovato il prodotto,
+    //           poi gli altri in ordine ──
+    const sitesToTry = [foundSite, ...ISHARES_SITES.filter(s => s.locale !== foundSite.locale)];
+
+    for (const site of sitesToTry) {
+      console.log(`[fetch-ishares] Trying CSV download from ${site.locale}...`);
+      const csvText = await tryDownloadCsv(productId, site, ticker, cleanIsin);
+      if (csvText) {
+        console.log(`[fetch-ishares] CSV downloaded from ${site.locale}, length=${csvText.length}`);
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("X-ETF-Source", "ishares-full");
+        res.setHeader("X-Product-URL", productUrl);
+        res.setHeader("X-iShares-Locale", site.locale);
+        return res.status(200).send(csvText);
       }
     }
 
-    if (!productPageUrl) {
-      return res.status(404).json({
-        error: "ETF non trovato su iShares UK. Potrebbe non essere un ETF iShares o l'ISIN potrebbe essere di un altro emittente.",
-        suggestion: "justetf",
-      });
-    }
-
-    // Normalizza URL
-    if (productPageUrl.startsWith("/")) {
-      productPageUrl = "https://www.ishares.com" + productPageUrl;
-    }
-
-    // Estrai l'ID numerico dall'URL: /uk/individual/en/products/251882/ishares-...
-    const productIdMatch = productPageUrl.match(/\/products\/(\d+)\//);
-    if (!productIdMatch) {
-      return res.status(500).json({ error: "Impossibile estrarre product ID dall'URL: " + productPageUrl });
-    }
-    const productId = productIdMatch[1];
-
-    // ── Step 4: scarica il CSV ──
-    // Il timestamp cambia per emittente/sito; per UK è 1521771080935
-    // Per DE è 1478358465952, per US è 1467271812596
-    // Proviamo UK first
-    const csvUrl = `https://www.ishares.com/uk/individual/en/products/${productId}/${siteTimestamp}.ajax?fileType=csv&fileName=${ticker || isin}_holdings&dataType=fund`;
-
-    const csvRes = await fetch(csvUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        Accept: "text/csv,*/*",
-        Referer: productPageUrl,
-      },
+    // Nessun sito ha restituito un CSV valido
+    return res.status(502).json({
+      error: `Prodotto iShares trovato (ID: ${productId}) ma il CSV delle holdings non è disponibile. Prova a scaricare manualmente da iShares.`,
+      productUrl,
+      suggestion: "justetf",
     });
 
-    if (!csvRes.ok) {
-      return res.status(502).json({
-        error: `iShares ha risposto con ${csvRes.status}. L'ETF potrebbe non essere disponibile su iShares UK.`,
-        suggestion: "justetf",
-      });
-    }
-
-    const csvText = await csvRes.text();
-
-    // Verifica minima che sia un CSV valido con holdings
-    if (!csvText.includes("Weight") && !csvText.includes("Name") && !csvText.includes("Ticker")) {
-      return res.status(502).json({
-        error: "La risposta di iShares non contiene un CSV valido.",
-        suggestion: "justetf",
-      });
-    }
-
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("X-ETF-Source", "ishares-full");
-    res.setHeader("X-Product-URL", productPageUrl);
-    return res.status(200).send(csvText);
-
   } catch (err) {
-    console.error("fetch-ishares error:", err);
+    console.error("[fetch-ishares] error:", err);
     return res.status(500).json({ error: "Errore interno: " + err.message, suggestion: "justetf" });
   }
 }
