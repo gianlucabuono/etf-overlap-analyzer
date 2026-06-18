@@ -1,6 +1,192 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 
 const COLORS = ["#6366f1","#10b981","#f59e0b","#ef4444","#3b82f6","#ec4899","#8b5cf6","#14b8a6","#f97316","#84cc16"];
+
+// ── API helpers ──
+const API_BASE = ""; // Vercel: same origin /api/...
+
+async function fetchIshares(isin) {
+  const res = await fetch(`${API_BASE}/api/fetch-ishares?isin=${encodeURIComponent(isin)}`);
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("text/csv")) {
+    return { type: "csv", text: await res.text() };
+  }
+  const json = await res.json();
+  if (!res.ok) throw Object.assign(new Error(json.error || "Errore iShares"), { suggestion: json.suggestion });
+  return { type: "csv", text: json };
+}
+
+async function fetchJustetf(isin) {
+  const res = await fetch(`${API_BASE}/api/fetch-justetf?isin=${encodeURIComponent(isin)}`);
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || "Errore JustETF");
+  return { type: "justetf", data: json };
+}
+
+// Converti risposta JustETF nel formato interno ETF
+function justetfToEtf(data, color) {
+  const holdings = data.holdings.map(h => ({
+    name: h.name,
+    ticker: "",
+    weight: h.weight,
+    sector: h.sector || "N/D",
+    country: h.country || "N/D",
+  }));
+  return {
+    name: data.name || data.isin,
+    isin: data.isin,
+    holdings,
+    skipped: 0,
+    color,
+    source: "justetf",
+    coveredWeight: data.coveredWeight,
+    uncoveredWeight: data.uncoveredWeight,
+    totalHoldings: data.totalHoldings,
+    geoAllocation: data.geoAllocation || [],
+    sectorAllocation: data.sectorAllocation || [],
+    warning: data.warning,
+    url: data.url,
+  };
+}
+
+// ── Componente banner copertura parziale ──
+function CoverageBanner({ etf }) {
+  if (!etf || etf.source !== "justetf") return null;
+  const pct = etf.coveredWeight || 0;
+  const missing = etf.uncoveredWeight || 0;
+  const color = missing > 50 ? "#ef4444" : missing > 20 ? "#f59e0b" : "#10b981";
+  return (
+    <div style={{background:"#fff7ed",border:"2px solid #f59e0b",borderRadius:12,padding:"10px 14px",marginBottom:8,fontSize:12}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+        <span style={{fontSize:16}}>⚠️</span>
+        <strong style={{color:"#92400e"}}>Dati parziali — fonte JustETF</strong>
+      </div>
+      <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6}}>
+        <div style={{flex:1,background:"#e5e7eb",borderRadius:99,height:12,overflow:"hidden"}}>
+          <div style={{width:`${pct}%`,background:"#10b981",height:"100%",borderRadius:99}}/>
+        </div>
+        <span style={{fontWeight:700,color:"#065f46",minWidth:40}}>{pct.toFixed(1)}%</span>
+      </div>
+      <div style={{color:"#92400e",lineHeight:1.5}}>
+        Disponibili <strong>{etf.holdings.length} holdings</strong> su ~<strong>{etf.totalHoldings || "N/D"}</strong> totali, 
+        pari al <strong style={{color:"#065f46"}}>{pct.toFixed(1)}%</strong> del peso del fondo.
+        Il <strong style={{color}}>{missing.toFixed(1)}%</strong> rimanente (~{etf.totalHoldings ? etf.totalHoldings - etf.holdings.length : "N/D"} titoli) 
+        {" "}<strong>non è incluso nell'analisi overlap</strong>: i risultati sono sottostimati.
+        {" "}<a href={etf.url} target="_blank" rel="noopener noreferrer" style={{color:"#6366f1"}}>Vedi su JustETF →</a>
+      </div>
+    </div>
+  );
+}
+
+// ── Componente input ISIN ──
+function IsinLookup({ onEtfLoaded, existingIsins }) {
+  const [isin, setIsin] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [status, setStatus] = useState(""); // "trying-ishares" | "fallback-justetf" | ""
+
+  const isValidIsin = (s) => /^[A-Z]{2}[A-Z0-9]{10}$/.test(s.trim().toUpperCase());
+
+  const handleLookup = useCallback(async () => {
+    const cleanIsin = isin.trim().toUpperCase();
+    if (!isValidIsin(cleanIsin)) { setError("ISIN non valido (formato: 2 lettere + 10 alfanumerici, es. IE00B4L5Y983)"); return; }
+    if (existingIsins.includes(cleanIsin)) { setError("ETF già caricato"); return; }
+
+    setLoading(true); setError(""); setStatus("trying-ishares");
+
+    try {
+      // ── Prova 1: iShares (CSV completo) ──
+      try {
+        const result = await fetchIshares(cleanIsin);
+        if (result.type === "csv") {
+          const { holdings, skipped } = parseCSV(result.text);
+          if (holdings.length > 0) {
+            // Ottieni il nome dall'intestazione CSV
+            const firstLine = result.text.split("\n")[0] || "";
+            const nameLine = result.text.split("\n").find(l => l.toLowerCase().includes("fund name") || l.toLowerCase().includes("ishares")) || "";
+            const etfName = nameLine.replace(/[",]/g, "").trim() || `iShares ${cleanIsin}`;
+            onEtfLoaded({
+              name: etfName.length > 60 ? etfName.substring(0, 60) + "…" : etfName,
+              isin: cleanIsin,
+              holdings,
+              skipped,
+              color: null, // assegnato dal parent
+              source: "ishares-full",
+              coveredWeight: 100,
+              uncoveredWeight: 0,
+              totalHoldings: holdings.length,
+            });
+            setIsin(""); setStatus(""); setLoading(false);
+            return;
+          }
+        }
+      } catch (isharesErr) {
+        // Se il server suggerisce di usare JustETF, vai avanti
+        if (isharesErr.suggestion !== "justetf") {
+          // Errore non gestito — ma proviamo comunque JustETF
+        }
+      }
+
+      // ── Prova 2: JustETF (dati parziali) ──
+      setStatus("fallback-justetf");
+      const result = await fetchJustetf(cleanIsin);
+      if (result.type === "justetf") {
+        onEtfLoaded({ ...justetfToEtf(result.data, null), isin: cleanIsin });
+        setIsin(""); setStatus(""); setLoading(false);
+        return;
+      }
+
+      throw new Error("Nessuna fonte disponibile per questo ISIN");
+
+    } catch (err) {
+      setError(err.message || "Errore sconosciuto");
+      setStatus("");
+    } finally {
+      setLoading(false);
+    }
+  }, [isin, existingIsins, onEtfLoaded]);
+
+  const handleKey = (e) => { if (e.key === "Enter") handleLookup(); };
+
+  return (
+    <div style={{background:"linear-gradient(135deg,#ede9fe,#dbeafe)",borderRadius:16,padding:"16px 18px",marginBottom:16,border:"2px solid #c4b5fd"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+        <span style={{fontSize:20}}>🔍</span>
+        <div>
+          <div style={{fontWeight:700,fontSize:14,color:"#1e1b4b"}}>Cerca per ISIN</div>
+          <div style={{fontSize:11,color:"#6b7280"}}>iShares → holdings complete · Altri emittenti → top 10 via JustETF</div>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+        <input
+          value={isin}
+          onChange={e => { setIsin(e.target.value.toUpperCase()); setError(""); }}
+          onKeyDown={handleKey}
+          placeholder="es. IE00B4L5Y983"
+          maxLength={12}
+          style={{flex:1,minWidth:160,padding:"10px 14px",borderRadius:10,border:"2px solid #c4b5fd",fontSize:14,fontWeight:700,outline:"none",background:"#fff",letterSpacing:1}}
+        />
+        <button
+          onClick={handleLookup}
+          disabled={loading || !isin}
+          style={{padding:"10px 20px",borderRadius:10,border:"none",background:loading?"#9ca3af":"#6366f1",color:"#fff",fontWeight:700,fontSize:14,cursor:loading?"not-allowed":"pointer",whiteSpace:"nowrap",minWidth:120}}
+        >
+          {loading ? (
+            status === "trying-ishares" ? "⏳ iShares…" :
+            status === "fallback-justetf" ? "⏳ JustETF…" : "⏳ Carico…"
+          ) : "Carica ETF"}
+        </button>
+      </div>
+      {error && <div style={{marginTop:8,color:"#ef4444",fontSize:12,fontWeight:600}}>❌ {error}</div>}
+      {!error && (
+        <div style={{marginTop:8,fontSize:11,color:"#6b7280"}}>
+          <strong style={{color:"#4338ca"}}>iShares UCITS</strong>: holdings complete (100% copertura) · 
+          <strong style={{color:"#92400e"}}> Altri</strong>: top 10 holdings via JustETF con indicatore copertura
+        </div>
+      )}
+    </div>
+  );
+}
 
 // 11 visually distinct sector colors
 const SECTOR_COLORS_LIST = [
@@ -60,9 +246,6 @@ function parseCSV(text) {
   const si=headers.findIndex(h=>h.includes("settore")||h.includes("sector"));
   const ai=headers.findIndex(h=>h.includes("asset class")||h==="asset class");
   const gi=headers.findIndex(h=>h.includes("area geografica")||h.includes("geography")||h.includes("country")||h.includes("paese")||h.includes("area geo")||h==="location"||h.includes("location"));
-  console.log('DEBUG headers:', headers);
-  console.log('DEBUG gi:', gi, '-> ', headers[gi]);
-  console.log('DEBUG ni:', ni, '-> ', headers[ni]);
   if(ni===-1) return {holdings:[],skipped:0};
   const holdings=[]; let skipped=0;
   for(let i=hi+1;i<lines.length;i++){
@@ -561,81 +744,106 @@ export default function App() {
   const [investment,setInvestment]=useState("");
   const [overlapMode,setOverlapMode]=useState("min");
 
-  const handleFiles=files=>{
-    Array.from(files).forEach(file=>{
-      if(!file.name.endsWith(".csv")) return;
-      const reader=new FileReader();
-      reader.onload=e=>{
-        const {holdings,skipped}=parseCSV(e.target.result);
-        if(!holdings.length) return;
-        const name=file.name.replace(".csv","").replace(/_/g," ");
-        setEtfs(prev=>prev.find(etf=>etf.name===name)?prev:[...prev,{name,holdings,skipped,color:COLORS[prev.length%COLORS.length]}]);
+  // Aggiunge un ETF alla lista assegnando il colore corretto
+  const addEtf = useCallback((etfData) => {
+    setEtfs(prev => {
+      if (prev.find(e => e.isin && e.isin === etfData.isin)) return prev;
+      if (prev.find(e => e.name === etfData.name)) return prev;
+      const color = etfData.color || COLORS[prev.length % COLORS.length];
+      return [...prev, { ...etfData, color }];
+    });
+  }, []);
+
+  const handleFiles = files => {
+    Array.from(files).forEach(file => {
+      if (!file.name.endsWith(".csv")) return;
+      const reader = new FileReader();
+      reader.onload = e => {
+        const { holdings, skipped } = parseCSV(e.target.result);
+        if (!holdings.length) return;
+        const name = file.name.replace(".csv","").replace(/_/g," ");
+        addEtf({ name, holdings, skipped, source: "csv", coveredWeight: 100, uncoveredWeight: 0, totalHoldings: holdings.length });
       };
       reader.readAsText(file);
     });
   };
 
-  const matrix=useMemo(()=>{
-    const m={};
-    for(let i=0;i<etfs.length;i++) for(let j=0;j<etfs.length;j++){
-      if(i===j){m[`${i}-${j}`]=null;continue;}
-      if(j<i){m[`${i}-${j}`]=m[`${j}-${i}`];continue;}
-      m[`${i}-${j}`]=computeOverlap(etfs[i].holdings,etfs[j].holdings);
+  const existingIsins = etfs.map(e => e.isin).filter(Boolean);
+
+  const matrix = useMemo(() => {
+    const m = {};
+    for (let i=0;i<etfs.length;i++) for (let j=0;j<etfs.length;j++) {
+      if (i===j) { m[`${i}-${j}`]=null; continue; }
+      if (j<i)  { m[`${i}-${j}`]=m[`${j}-${i}`]; continue; }
+      m[`${i}-${j}`] = computeOverlap(etfs[i].holdings, etfs[j].holdings);
     }
     return m;
-  },[etfs]);
+  }, [etfs]);
 
-  const allOverlaps=useMemo(()=>{
-    const map={};
-    for(let i=0;i<etfs.length;i++) for(let j=i+1;j<etfs.length;j++){
-      const ov=matrix[`${i}-${j}`]; if(!ov) continue;
-      ov.common.forEach(h=>{
-        if(!map[h.name]) map[h.name]={name:h.name,pairs:[],avgWeight:0,weights:{}};
-        map[h.name].pairs.push({etfA:etfs[i].name,etfB:etfs[j].name,wA:h.weightA,wB:h.weightB});
-        map[h.name].avgWeight=Math.max(map[h.name].avgWeight,h.avgWeight);
-        map[h.name].weights[etfs[i].name]=h.weightA;
-        map[h.name].weights[etfs[j].name]=h.weightB;
+  const allOverlaps = useMemo(() => {
+    const map = {};
+    for (let i=0;i<etfs.length;i++) for (let j=i+1;j<etfs.length;j++) {
+      const ov = matrix[`${i}-${j}`]; if (!ov) continue;
+      ov.common.forEach(h => {
+        if (!map[h.name]) map[h.name] = { name:h.name, pairs:[], avgWeight:0, weights:{} };
+        map[h.name].pairs.push({ etfA:etfs[i].name, etfB:etfs[j].name, wA:h.weightA, wB:h.weightB });
+        map[h.name].avgWeight = Math.max(map[h.name].avgWeight, h.avgWeight);
+        map[h.name].weights[etfs[i].name] = h.weightA;
+        map[h.name].weights[etfs[j].name] = h.weightB;
       });
     }
     return Object.values(map);
-  },[etfs,matrix]);
+  }, [etfs, matrix]);
 
-  const filtered=useMemo(()=>{
-    return allOverlaps
-      .filter(h=>h.name.toLowerCase().includes(filterName.toLowerCase()))
-      .sort((a,b)=>{
-        const wa=sortEtf!=null?(a.weights[sortEtf]||0):a.avgWeight;
-        const wb=sortEtf!=null?(b.weights[sortEtf]||0):b.avgWeight;
-        return sortDir==="desc"?wb-wa:wa-wb;
-      });
-  },[allOverlaps,filterName,sortDir,sortEtf]);
+  const filtered = useMemo(() =>
+    allOverlaps
+      .filter(h => h.name.toLowerCase().includes(filterName.toLowerCase()))
+      .sort((a,b) => {
+        const wa = sortEtf!=null ? (a.weights[sortEtf]||0) : a.avgWeight;
+        const wb = sortEtf!=null ? (b.weights[sortEtf]||0) : b.avgWeight;
+        return sortDir==="desc" ? wb-wa : wa-wb;
+      }),
+  [allOverlaps, filterName, sortDir, sortEtf]);
 
-  const inv=parseFloat(investment)||0;
-  const overlapColor=pct=>pct>60?"#ef4444":pct>30?"#f59e0b":pct>10?"#6366f1":"#10b981";
-
-  const matrixOverlapPct=(i,j)=>{
-    const ov=matrix[`${i}-${j}`]||matrix[`${j}-${i}`];
-    if(!ov) return 0;
-    return computeOverlapPct(ov.common,overlapMode);
+  const inv = parseFloat(investment)||0;
+  const overlapColor = pct => pct>60?"#ef4444":pct>30?"#f59e0b":pct>10?"#6366f1":"#10b981";
+  const matrixOverlapPct = (i,j) => {
+    const ov = matrix[`${i}-${j}`]||matrix[`${j}-${i}`];
+    return ov ? computeOverlapPct(ov.common, overlapMode) : 0;
   };
+
+  // Banner globale se almeno un ETF ha dati parziali
+  const partialEtfs = etfs.filter(e => e.source === "justetf");
 
   return (
     <div style={s.page}>
       <div style={{...s.card,maxWidth:920}}>
         <div style={s.logo}>📊</div>
         <h1 style={s.title}>ETF Overlap Analyzer</h1>
-        <p style={s.sub}>Carica i CSV delle holdings di più ETF per analizzare sovrapposizioni e distribuzione geografica.</p>
+        <p style={s.sub}>Cerca per ISIN o carica i CSV delle holdings · Analizza sovrapposizioni e distribuzione geografica.</p>
 
+        {/* ── ISIN Lookup ── */}
+        <IsinLookup onEtfLoaded={addEtf} existingIsins={existingIsins} />
+
+        {/* ── Separatore ── */}
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+          <div style={{flex:1,height:1,background:"#e5e7eb"}}/>
+          <span style={{fontSize:11,color:"#9ca3af",fontWeight:600}}>oppure carica CSV manualmente</span>
+          <div style={{flex:1,height:1,background:"#e5e7eb"}}/>
+        </div>
+
+        {/* ── Drop zone CSV ── */}
         <div style={{...s.dropzone,borderColor:dragging?"#6366f1":"#e5e7eb",background:dragging?"#ede9fe":"#f9fafb"}}
           onDrop={e=>{e.preventDefault();setDragging(false);handleFiles(e.dataTransfer.files);}}
           onDragOver={e=>{e.preventDefault();setDragging(true);}} onDragLeave={()=>setDragging(false)}
           onClick={()=>document.getElementById("csvInput").click()}>
-          <div style={{fontSize:36,marginBottom:8}}>📂</div>
-          <div style={{fontWeight:700,color:"#374151"}}>Trascina i CSV qui o clicca per selezionarli</div>
-          <div style={{fontSize:12,color:"#9ca3af",marginTop:4}}>Supporta iShares, Vanguard, JustETF · Più file contemporaneamente</div>
+          <div style={{fontSize:32,marginBottom:6}}>📂</div>
+          <div style={{fontWeight:700,color:"#374151",fontSize:14}}>Trascina i CSV qui o clicca per selezionarli</div>
+          <div style={{fontSize:11,color:"#9ca3af",marginTop:4}}>Supporta iShares, Vanguard, Amundi, SPDR · Più file contemporaneamente</div>
           <input id="csvInput" type="file" accept=".csv" multiple style={{display:"none"}} onChange={e=>handleFiles(e.target.files)}/>
         </div>
 
+        {/* ── Investimento opzionale ── */}
         <div style={{display:"flex",alignItems:"center",gap:10,margin:"14px 0",background:"#f9fafb",borderRadius:12,padding:"12px 16px"}}>
           <span style={{fontSize:20}}>💶</span>
           <div style={{flex:1}}>
@@ -646,15 +854,34 @@ export default function App() {
             style={{padding:"8px 12px",borderRadius:10,border:"2px solid #e5e7eb",fontSize:14,fontWeight:700,width:130,outline:"none"}}/>
         </div>
 
+        {/* ── ETF caricati ── */}
         {etfs.length>0&&(
           <>
             <OverlapModeSelector mode={overlapMode} setMode={setOverlapMode}/>
+
+            {/* Banner copertura parziale per ogni ETF JustETF */}
+            {partialEtfs.map((etf,i)=><CoverageBanner key={i} etf={etf}/>)}
+
             <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:16}}>
               {etfs.map((etf,i)=>(
                 <div key={i} style={{display:"flex",alignItems:"center",gap:6,background:etf.color+"22",border:`2px solid ${etf.color}`,borderRadius:99,padding:"4px 12px"}}>
                   <div style={{width:8,height:8,borderRadius:"50%",background:etf.color}}/>
                   <span style={{fontWeight:700,fontSize:13,color:"#1f2937"}}>{etf.name}</span>
-                  <span style={{fontSize:11,color:"#6b7280"}}>({etf.holdings.length} holdings{etf.skipped>0?`, ${etf.skipped} scartate`:""})</span>
+                  {etf.source==="justetf"&&(
+                    <span title={`Dati parziali: ${etf.coveredWeight?.toFixed(1)}% copertura`}
+                      style={{fontSize:10,background:"#fef3c7",color:"#92400e",borderRadius:99,padding:"1px 7px",fontWeight:700,cursor:"help"}}>
+                      ⚠️ {etf.coveredWeight?.toFixed(0)}% cov.
+                    </span>
+                  )}
+                  {etf.source==="ishares-full"&&(
+                    <span style={{fontSize:10,background:"#d1fae5",color:"#065f46",borderRadius:99,padding:"1px 7px",fontWeight:700}}>
+                      ✓ 100%
+                    </span>
+                  )}
+                  <span style={{fontSize:11,color:"#6b7280"}}>
+                    ({etf.holdings.length}{etf.totalHoldings&&etf.totalHoldings!==etf.holdings.length?`/${etf.totalHoldings}`:""} holdings
+                    {etf.skipped>0?`, ${etf.skipped} scartate`:""})
+                  </span>
                   <button style={{background:"none",border:"none",cursor:"pointer",color:"#9ca3af",fontSize:14,padding:0}}
                     onClick={()=>setEtfs(prev=>prev.filter((_,j)=>j!==i))}>✕</button>
                 </div>
@@ -664,6 +891,7 @@ export default function App() {
           </>
         )}
 
+        {/* ── Tabs analisi ── */}
         {etfs.length>=1&&(
           <>
             <div style={{display:"flex",gap:8,marginBottom:20,flexWrap:"wrap"}}>
@@ -675,44 +903,66 @@ export default function App() {
               ))}
             </div>
 
+            {/* Matrice */}
             {activeTab==="matrix"&&etfs.length>=2&&(
-              <div style={{overflowX:"auto"}}>
-                <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
-                  <thead>
-                    <tr>
-                      <th style={s.th}>ETF</th>
-                      <th style={{...s.th,color:"#6b7280"}}>Tot. holdings</th>
-                      {etfs.map((etf,i)=><th key={i} style={{...s.th,color:etf.color}}>{etf.name}</th>)}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {etfs.map((etfA,i)=>(
-                      <tr key={i}>
-                        <td style={{...s.td,fontWeight:700,color:etfA.color,whiteSpace:"nowrap"}}>{etfA.name}</td>
-                        <td style={{...s.td,textAlign:"center",fontWeight:700,color:"#374151"}}>{etfA.holdings.length}</td>
-                        {etfs.map((etfB,j)=>{
-                          if(i===j) return <td key={j} style={{...s.td,background:"#f3f4f6",textAlign:"center"}}>—</td>;
-                          const ov=matrix[`${i}-${j}`]||matrix[`${j}-${i}`];
-                          const pct=matrixOverlapPct(i,j);
-                          return (
-                            <td key={j} style={{...s.td,textAlign:"center"}}>
-                              <span style={{fontWeight:800,fontSize:16,color:overlapColor(pct)}}>{pct.toFixed(1)}%</span>
-                              <div style={{fontSize:10,color:"#9ca3af"}}>{ov?.common.length} comuni</div>
-                            </td>
-                          );
-                        })}
+              <div>
+                {partialEtfs.length>0&&(
+                  <div style={{background:"#fff7ed",border:"1px solid #f59e0b",borderRadius:10,padding:"8px 12px",marginBottom:12,fontSize:12,color:"#92400e"}}>
+                    ⚠️ <strong>Attenzione:</strong> {partialEtfs.map(e=>e.name).join(", ")} ha dati parziali (JustETF top 10). 
+                    I valori di overlap con questi ETF sono <strong>sottostimati</strong>.
+                  </div>
+                )}
+                <div style={{overflowX:"auto"}}>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+                    <thead>
+                      <tr>
+                        <th style={s.th}>ETF</th>
+                        <th style={{...s.th,color:"#6b7280"}}>Holdings</th>
+                        <th style={{...s.th,color:"#6b7280"}}>Copertura</th>
+                        {etfs.map((etf,i)=><th key={i} style={{...s.th,color:etf.color}}>{etf.name}</th>)}
                       </tr>
+                    </thead>
+                    <tbody>
+                      {etfs.map((etfA,i)=>(
+                        <tr key={i}>
+                          <td style={{...s.td,fontWeight:700,color:etfA.color,whiteSpace:"nowrap"}}>{etfA.name}</td>
+                          <td style={{...s.td,textAlign:"center",fontWeight:700,color:"#374151"}}>
+                            {etfA.holdings.length}{etfA.totalHoldings&&etfA.totalHoldings!==etfA.holdings.length?`/${etfA.totalHoldings}`:""}
+                          </td>
+                          <td style={{...s.td,textAlign:"center"}}>
+                            {etfA.source==="justetf"
+                              ? <span style={{color:"#f59e0b",fontWeight:700}}>{etfA.coveredWeight?.toFixed(1)}%</span>
+                              : <span style={{color:"#10b981",fontWeight:700}}>100%</span>}
+                          </td>
+                          {etfs.map((etfB,j)=>{
+                            if (i===j) return <td key={j} style={{...s.td,background:"#f3f4f6",textAlign:"center"}}>—</td>;
+                            const ov = matrix[`${i}-${j}`]||matrix[`${j}-${i}`];
+                            const pct = matrixOverlapPct(i,j);
+                            const isPartial = etfA.source==="justetf"||etfB.source==="justetf";
+                            return (
+                              <td key={j} style={{...s.td,textAlign:"center"}}>
+                                <span style={{fontWeight:800,fontSize:16,color:overlapColor(pct)}}>
+                                  {pct.toFixed(1)}%{isPartial?"*":""}
+                                </span>
+                                <div style={{fontSize:10,color:"#9ca3af"}}>{ov?.common.length} comuni</div>
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div style={{display:"flex",gap:12,marginTop:12,fontSize:12,color:"#6b7280",flexWrap:"wrap",alignItems:"center"}}>
+                    {[["#10b981","< 10%"],["#6366f1","10-30%"],["#f59e0b","30-60%"],["#ef4444","> 60%"]].map(([c,l])=>(
+                      <div key={l} style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:10,height:10,borderRadius:2,background:c}}/>{l}</div>
                     ))}
-                  </tbody>
-                </table>
-                <div style={{display:"flex",gap:12,marginTop:12,fontSize:12,color:"#6b7280",flexWrap:"wrap"}}>
-                  {[["#10b981","< 10%"],["#6366f1","10-30%"],["#f59e0b","30-60%"],["#ef4444","> 60%"]].map(([c,l])=>(
-                    <div key={l} style={{display:"flex",alignItems:"center",gap:4}}><div style={{width:10,height:10,borderRadius:2,background:c}}/>{l}</div>
-                  ))}
+                    {partialEtfs.length>0&&<span style={{color:"#f59e0b",marginLeft:8}}>* dato sottostimato (copertura parziale)</span>}
+                  </div>
                 </div>
               </div>
             )}
 
+            {/* Visualizzazioni */}
             {activeTab==="visual"&&etfs.length>=2&&(
               <div>
                 <div style={{display:"flex",gap:8,marginBottom:20,flexWrap:"wrap"}}>
@@ -728,6 +978,7 @@ export default function App() {
               </div>
             )}
 
+            {/* Dettaglio */}
             {activeTab==="detail"&&etfs.length>=2&&(
               <div>
                 <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
@@ -769,12 +1020,15 @@ export default function App() {
               </div>
             )}
 
+            {/* Geografia */}
             {activeTab==="geo"&&<Geography etfs={etfs}/>}
           </>
         )}
 
         {etfs.length===0&&(
-          <div style={{textAlign:"center",padding:20,color:"#9ca3af",fontSize:14}}>Carica almeno un CSV per iniziare 👆</div>
+          <div style={{textAlign:"center",padding:20,color:"#9ca3af",fontSize:14}}>
+            Inserisci un ISIN qui sopra oppure carica un CSV per iniziare 👆
+          </div>
         )}
       </div>
     </div>
