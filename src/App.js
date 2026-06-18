@@ -102,7 +102,6 @@ function IsinLookup({ onEtfLoaded, existingIsins }) {
           const { holdings, skipped } = parseCSV(result.text);
           if (holdings.length > 0) {
             // Ottieni il nome dall'intestazione CSV
-            const firstLine = result.text.split("\n")[0] || "";
             const nameLine = result.text.split("\n").find(l => l.toLowerCase().includes("fund name") || l.toLowerCase().includes("ishares")) || "";
             const etfName = nameLine.replace(/[",]/g, "").trim() || `iShares ${cleanIsin}`;
             onEtfLoaded({
